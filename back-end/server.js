@@ -1,29 +1,11 @@
 require('dotenv').config();
 const express = require('express');
-const mysql = require('mysql');
 const cors = require('cors');
+const db = require('./db'); // Import the db connection
+
 const app = express();
-
 app.use(cors());
-app.use(express.json()); // To parse JSON bodies
-
-// Create a connection to the MySQL database
-const db = mysql.createConnection({
-  host: process.env.DB_HOST || 'mysql',
-  user: process.env.DB_USER || 'user',
-  password: process.env.DB_PASS || 'mydatabasepassword',
-  database: process.env.DB_NAME || 'mydatabase',
-  port: process.env.DB_PORT || 3306,
-});
-
-// Connect to the database
-db.connect((err) => {
-  if (err) {
-    console.error('Database connection failed: ' + err.stack);
-    return;
-  }
-  console.log('Connected to MySQL database');
-});
+app.use(express.json());
 
 // API route to fetch queue data
 app.get('/api/queue', (req, res) => {
@@ -37,45 +19,109 @@ app.get('/api/queue', (req, res) => {
   });
 });
 
-app.post('/api/update-table-status', (req, res) => {
-  const { table_id, status } = req.body;
-  db.query('UPDATE TableStatus SET status = ?, last_updated = NOW() WHERE table_id = ?', [status, table_id], (err, result) => {
+// API route to fetch table statuses
+app.get('/api/table-statuses', (req, res) => {
+  const sql = 'SELECT * FROM TableStatus';
+  db.query(sql, (err, result) => {
     if (err) {
-      console.error('Database update error:', err);
-      return res.status(500).send('Error updating table status');
+      console.error('Error fetching table statuses:', err);
+      return res.status(500).send('Error fetching table statuses');
     }
-    res.send('Table status updated successfully');
+    res.json(result);
   });
 });
-
-
-app.post('/api/update-table-status-from-visit', (req, res) => {
-  const querySelectVisit = 'SELECT * FROM db_visit_info WHERE Status = "รอ"'; // Select patients who are waiting
-
-  db.query(querySelectVisit, (err, visitResults) => {
+app.get('/api/visitqueue', (req, res) => {
+  const sql = 'SELECT * FROM visitqueue'; // Modify as needed
+  db.query(sql, (err, result) => {
     if (err) {
-      console.error('Error selecting visit info:', err);
-      return res.status(500).send('Error selecting visit info');
+      console.error('Error fetching data from visitqueue:', err);
+      return res.status(500).send('Error fetching data from visitqueue');
+    }
+    res.json(result);
+  });
+});
+app.post('/api/update-service', (req, res) => {
+  const { table_id, status, Q_no } = req.body;
+
+  const sql = 'UPDATE TableStatus SET status = ?, last_updated = NOW() WHERE table_id = ?';
+  db.query(sql, [status, table_id], (err, result) => {
+      if (err) {
+          console.error('Error updating table status:', err);
+          return res.status(500).send('Error updating table status');
+      }
+
+      console.log(`Updated table ${table_id} to status: ${status}`);
+      
+      // Update VisitQueue with the service information if needed
+      const updateQueueSql = 'UPDATE visitQueue SET table_id = ?, visit_status = "กำลังเข้ารับบริการ" WHERE Q_no = ?';
+      db.query(updateQueueSql, [table_id, Q_no], (err, result) => {
+          if (err) {
+              console.error('Error updating queue data:', err);
+              return res.status(500).send('Error updating queue data');
+          }
+
+          res.send('Table status and queue data updated successfully');
+      });
+  });
+});
+app.post('/api/move-to-visitQueue', (req, res) => {
+  const sqlSelect = 'SELECT * FROM db_visit_info ORDER BY id ASC';
+  
+  db.query(sqlSelect, (err, results) => {
+    if (err) {
+      console.error('Error fetching data from db_visit_info:', err);
+      return res.status(500).send('Error fetching data from db_visit_info');
     }
 
-    // Loop through the patients and update the TableStatus
-    visitResults.forEach((visit) => {
-      const tableId = `โต๊ะ${visit.id}`; // Example of generating table ID
-      const queryUpdateTable = 'UPDATE TableStatus SET status = "ไม่ว่าง", last_updated = NOW() WHERE table_id = ?';
+    results.forEach((record, index) => {
+      const sqlInsert = 'INSERT INTO visitQueue (Q_no, user_name, visit_date, table_id, visit_status) VALUES (?, ?, ?, NULL, "รอการเข้ารับบริการ")';
+      db.query(sqlInsert, [record.Q_no, record.user_name, record.visit_date], (err, result) => {
+        if (err) {
+          console.error('Error inserting data into visitQueue:', err);
+          return res.status(500).send('Error inserting data into visitQueue');
+        }
 
-      db.query(queryUpdateTable, [tableId], (updateErr) => {
-        if (updateErr) {
-          console.error(`Error updating table status for table ${tableId}:`, updateErr);
+        if (index === results.length - 1) {
+          res.send('Data moved to visitQueue successfully');
         }
       });
     });
-
-    res.send('Table status updated based on visit info');
   });
 });
 
+app.post('/api/assign-to-table', (req, res) => {
+  const { table_id, Q_no } = req.body;
+  if (!table_id || !Q_no) {
+    return res.status(400).send('Missing table_id or Q_no');
+  }
 
-// Start the server
+  const updateTableSql = 'UPDATE TableStatus SET status = "occupied", last_updated = NOW() WHERE table_id = ?';
+  db.query(updateTableSql, [table_id], (err, result) => {
+    if (err) {
+      console.error('Error updating table status:', err);
+      return res.status(500).send('Error updating table status');
+    }
+
+    const moveQueueSql = `
+      INSERT INTO visitQueue (Q_no, table_id, visit_status, visit_date)
+      SELECT Q_no, ?, 'กำลังเข้ารับบริการ', NOW() 
+      FROM db_visit_info 
+      WHERE Q_no = ?
+    `;
+    db.query(moveQueueSql, [table_id, Q_no], (err, result) => {
+      if (err) {
+        console.error('Error moving queue data:', err);
+        alert('Error: ' + err.message);
+        console.log('Assigning Q_no:', Q_no, 'to table:', table_id);
+
+        return res.status(500).send('Error moving queue data: ' + err.message);
+      }
+
+      res.send('Queue assigned to table and data moved successfully');
+    });
+  });
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
